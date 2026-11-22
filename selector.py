@@ -241,6 +241,11 @@ class Map:
         self.import_lines = {f: set(v) for f, v in m["import_lines"].items()}
         self.opens = m["opens"]
         self.classes = m.get("classes", {})
+        self.cpu = {}
+        for i, c in enumerate(m.get("cpu", [])):
+            if self.conv[i] is not None:
+                self.cpu[self.conv[i]] = c
+        self.setup = m.get("setup", {})
 
     def _num(self, idxs):
         return {self.conv[i] for i in idxs if i >= 0 and self.conv[i] is not None}
@@ -346,6 +351,11 @@ def candidates(files, mp, tests, all_nums):
             cand |= set(all_nums)
         if path.startswith("tests/") and path.endswith(".py"):
             cand |= tests_in_file(tests, path)
+        if old is None or new is None or old != new:
+            for pth in {old, new} - {None}:
+                d = pth.rsplit("/", 1)[0] if "/" in pth else ""
+                dt, _ = mp.open_tests("DIR:" + d)
+                cand |= dt
         if path.endswith(".py") and (old is None or new is None or old != new):
             # module added/removed/renamed: import-sensitive tests
             cand |= dir_tests(mp, tests, path)
@@ -536,6 +546,86 @@ def build_overlay(root, changes):
 RUNNER = APP / "runner_plugin.py"
 
 
+WARM = ["pytest", "_pytest.python", "_pytest.unittest", "_pytest.runner", "_pytest.main", "_pytest.terminal",
+        "_pytest.fixtures", "_pytest.mark", "_pytest.skipping", "_pytest.capture", "_pytest.logging",
+        "_pytest.warnings", "_pytest.subtests", "pytest_timeout", "xdist", "xdist.plugin", "numpy", "pandas",
+        "pandas.testing", "duckdb", "csv", "gzip", "tracemalloc", "unittest", "unittest.mock", "decimal",
+        "datetime", "zoneinfo", "multiprocessing", "concurrent.futures", "concurrent.futures.process",
+        "dateutil", "dateutil.parser", "pytz", "runner_plugin", "typing_extensions", "inspect", "dataclasses",
+        "textwrap", "difflib", "pickle", "uuid", "statistics", "math", "functools", "itertools", "logging"]
+
+
+def warm_imports():
+    for k in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+        os.environ.setdefault(k, "1")
+    if str(APP) not in sys.path:
+        sys.path.insert(0, str(APP))
+    import importlib
+    for m in WARM:
+        try:
+            importlib.import_module(m)
+        except Exception as e:  # noqa: BLE001
+            log("warm import failed", m, e)
+    bad = [m for m in sys.modules if m == "sqlglot" or m.startswith("sqlglot.") or m == "tests" or m.startswith("tests.")]
+    for m in bad:
+        del sys.modules[m]
+    if bad:
+        log("dropped pre-imported", len(bad), "sqlglot/tests modules")
+
+
+def fork_pytest(root, args, envupd):
+    """Fork a child that runs pytest in the overlay. Returns pid."""
+    pid = os.fork()
+    if pid == 0:
+        try:
+            fd = os.open(os.devnull, os.O_RDWR)
+            os.dup2(fd, 1)
+            os.dup2(fd, 2)
+            os.chdir(root)
+            os.environ.update(envupd)
+            sys.path[:0] = [str(root)]
+            import pytest
+            pytest.main(args)
+        finally:
+            os._exit(0)
+    return pid
+
+
+def prepare_run(cid, changes, nums, tests_by_num):
+    root = TMP / f"ov_{cid}"
+    build_overlay(root, changes)
+    ids = sorted(tests_by_num[n]["id"] for n in nums)
+    res_file = TMP / f"res_{cid}.json"
+    args_file = TMP / f"args_{cid}.txt"
+    args_file.write_text("\n".join(ids))
+    to_file = TMP / f"to_{cid}.json"
+    to_file.write_text(json.dumps({tests_by_num[n]["id"]: max(10.0, 8 * tests_by_num[n]["seconds"]) for n in nums}))
+    envupd = dict(PYTHONDONTWRITEBYTECODE="1", SKIP_INTEGRATION="0", BR_RES=str(res_file),
+                  BR_WANTED=str(args_file), BR_TIMEOUTS=str(to_file), HOME=str(TMP),
+                  PYTHONPATH=f"{root}:{APP}")
+    test_files = sorted({tests_by_num[n]["file"] for n in nums})
+    test_files = [f for f in test_files if (root / f).exists()]
+    args = ["-q", "-p", "no:cacheprovider", "-p", "runner_plugin", "--rootdir", str(root), "-o", "addopts=",
+            "--no-header", "-rN", "--tb=no", "--assert=plain", "-W", "ignore"] + test_files
+    budget = max(30.0, sum(tests_by_num[n]["seconds"] for n in nums) * 8 + 30)
+    return root, args, envupd, budget, res_file, [args_file, to_file, res_file]
+
+
+def collect_run(cid, root, res_file, cleanup):
+    r = None
+    try:
+        r = json.loads(res_file.read_text())
+    except Exception as e:  # noqa: BLE001
+        log(cid, "runner produced no result", e)
+    shutil.rmtree(root, ignore_errors=True)
+    for f in cleanup:
+        try:
+            f.unlink()
+        except OSError:
+            pass
+    return r
+
+
 def run_tests(cid, changes, nums, tests_by_num):
     root = TMP / f"ov_{cid}"
     build_overlay(root, changes)
@@ -589,6 +679,29 @@ def is_blind(t):
     if f == "tests/test_optimizer.py" and s >= 0.3:
         return True  # process-pool fixture tests: CPU far above recorded wall time
     return s >= 1.0
+
+
+CPU_K = float(os.environ.get("BR_K", "0.07"))  # profile CPU (map) -> scorer CPU seconds
+
+
+def choose_blind(allc, tests_by_num, mp):
+    """Per test class: include unverified when that is cheaper than running it."""
+    if not mp.cpu:
+        return {n for n in allc if is_blind(tests_by_num[n])}
+    groups = {}
+    for n in allc:
+        g = "::".join(tests_by_num[n]["id"].split("::")[:-1])
+        groups.setdefault(g, set()).add(n)
+    blind = set()
+    for g, ns in groups.items():
+        all_blind = sum(tests_by_num[n]["seconds"] for n in ns)
+        per = {n: (tests_by_num[n]["seconds"], CPU_K * mp.cpu.get(n, 1.0)) for n in ns}
+        mixed = CPU_K * mp.setup.get(g, 0.0) + sum(min(a, b) for a, b in per.values())
+        if all_blind <= mixed:
+            blind |= ns
+        else:
+            blind |= {n for n, (a, b) in per.items() if a < b}
+    return blind
 
 
 # --------------------------------------------------------------------------- split
@@ -649,39 +762,86 @@ def main():
     est = sum(sum(tests_by_num[n]["seconds"] for n in c) for _, _, c in jobs)
     log(f"{len(jobs)} commits to run, est {est:.1f}s of tests")
 
-    def work(job):
-        cid, changes, allc = job
-        blind = {n for n in allc if is_blind(tests_by_num[n])}
-        cand = allc - blind
-        if not cand:
-            return cid, sorted(blind), f"blind {len(blind)}"
-        if time.time() - START > DEADLINE:
-            return cid, sorted(allc), "deadline"
-        r = run_tests(cid, changes, cand, tests_by_num)
+    def interpret(cid, allc, blind, cand, r):
         if r is None:
-            return cid, sorted(allc), "runner-failed"
+            return sorted(allc), "runner-failed"
         failed = set()
         for nid in r.get("failed", []):
             if nid in by_id:
                 failed.add(by_id[nid])
         for fpath in r.get("collect_failed", []):
             # module failed to import: every selected test in it fails
+            fp = fpath.rstrip("/")
             for n in cand:
-                tid = tests_by_num[n]["id"]
-                if tid == fpath or tid.startswith(fpath.rstrip("/") + "::") or tests_by_num[n]["file"].startswith(fpath.rstrip("/")):
+                if tests_by_num[n]["id"].startswith(fp + "::") or tests_by_num[n]["file"].startswith(fp):
                     failed.add(n)
         # selected tests never reported (not collected) count as failing to be safe
         seen = set(r.get("seen", []))
         for n in cand:
             if tests_by_num[n]["id"] not in seen:
                 failed.add(n)
-        return cid, sorted((failed & cand) | blind), f"ran {len(cand)} blind {len(blind)}"
+        return sorted((failed & cand) | blind), f"ran {len(cand)} blind {len(blind)}"
 
     jobs.sort(key=lambda j: -sum(tests_by_num[n]["seconds"] for n in j[2]))
-    with ThreadPoolExecutor(PARALLEL) as ex:
-        for cid, failed, why in ex.map(work, jobs):
-            answers[cid] = failed
-            log(cid, why, "->", len(failed), "failing")
+    queue = []
+    for cid, changes, allc in jobs:
+        blind = choose_blind(allc, tests_by_num, mp)
+        cand = allc - blind
+        if not cand:
+            answers[cid] = sorted(blind)
+            log(cid, "blind", len(blind))
+        else:
+            queue.append((cid, changes, allc, blind, cand))
+
+    use_fork = os.environ.get("BR_FORK", "1") == "1" and hasattr(os, "fork")
+    if use_fork:
+        warm_imports()
+        running = {}  # pid -> (job, started, budget, root, res_file, cleanup)
+        while queue or running:
+            while queue and len(running) < PARALLEL:
+                job = queue.pop(0)
+                cid, changes, allc, blind, cand = job
+                if time.time() - START > DEADLINE:
+                    answers[cid] = sorted(allc)
+                    log(cid, "deadline")
+                    continue
+                root, args, envupd, budget, res_file, cleanup = prepare_run(cid, changes, cand, tests_by_num)
+                pid = fork_pytest(root, args, envupd)
+                running[pid] = (job, time.time(), budget, root, res_file, cleanup)
+            if not running:
+                break
+            pid, status = os.waitpid(-1, os.WNOHANG)
+            if pid == 0:
+                now = time.time()
+                for rp, (job, started, budget, *_rest) in list(running.items()):
+                    if now - started > budget:
+                        log(job[0], "killing after", round(now - started, 1))
+                        try:
+                            os.kill(rp, 9)
+                        except OSError:
+                            pass
+                time.sleep(0.01)
+                continue
+            if pid not in running:
+                continue
+            job, started, budget, root, res_file, cleanup = running.pop(pid)
+            cid, changes, allc, blind, cand = job
+            r = collect_run(cid, root, res_file, cleanup)
+            answers[cid], why = interpret(cid, allc, blind, cand, r)
+            log(cid, why, "->", len(answers[cid]), f"failing ({time.time() - started:.1f}s)")
+    else:
+        def work(job):
+            cid, changes, allc, blind, cand = job
+            if time.time() - START > DEADLINE:
+                return cid, sorted(allc), "deadline"
+            r = run_tests(cid, changes, cand, tests_by_num)
+            res, why = interpret(cid, allc, blind, cand, r)
+            return cid, res, why
+
+        with ThreadPoolExecutor(PARALLEL) as ex:
+            for cid, res, why in ex.map(work, queue):
+                answers[cid] = res
+                log(cid, why, "->", len(res), "failing")
     for p in patches:
         cid = p.stem
         nums = answers.get(cid, sorted(all_nums))
