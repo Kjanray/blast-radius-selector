@@ -246,6 +246,27 @@ class Map:
             if self.conv[i] is not None:
                 self.cpu[self.conv[i]] = c
         self.setup = m.get("setup", {})
+        self.csets = [set(x) for x in m.get("csets", [])]
+        self.cases = {}  # data test number -> case info
+        for tid, info in m.get("cases", {}).items():
+            n = num.get(tid)
+            if n is not None:
+                self.cases[n] = info
+
+    def allowed_cases(self, n, spans):
+        info = self.cases.get(n)
+        if info is None:
+            return None
+        acc = set()
+        for path, st, en in spans:
+            fl = info["files"].get(path)
+            if not fl:
+                continue
+            for ln in range(st, en + 1):
+                sid_ = fl.get(str(ln))
+                if sid_ is not None:
+                    acc |= self.csets[sid_]
+        return acc
 
     def _num(self, idxs):
         return {self.conv[i] for i in idxs if i >= 0 and self.conv[i] is not None}
@@ -287,7 +308,12 @@ def tests_in_file(tests, path):
     return {t["number"] for t in tests if t["file"] == path}
 
 
+TOUCH = {"spans": [], "uncon": False}
+
+
 def candidates(files, mp, tests, all_nums):
+    TOUCH["spans"] = []
+    TOUCH["uncon"] = False
     """Return (candidate test numbers, needs_run, reason)."""
     cand = set()
     any_effect = False
@@ -310,6 +336,7 @@ def candidates(files, mp, tests, all_nums):
             if cu is None:
                 # syntax error: whatever imports this file fails; run everything that touches it
                 any_effect = True
+                TOUCH["uncon"] = True
                 cand |= mp.file_tests(old)
                 if old.startswith("tests/"):
                     cand |= tests_in_file(tests, old)
@@ -325,9 +352,11 @@ def candidates(files, mp, tests, all_nums):
                 if kind == "func":
                     cand |= precise_func_tests(mp, old, old_tree, s, e, removed, inserts)
                 elif kind == "cls":
+                    TOUCH["uncon"] = True
                     cand |= mp.span_tests(old, s, e)
                     cand |= class_users(mp, old, q, old_text)
                 else:
+                    TOUCH["uncon"] = True
                     cand |= mp.file_tests(old)
                 if old.startswith("tests/"):
                     # test code: tests defined in the changed span
@@ -344,6 +373,7 @@ def candidates(files, mp, tests, all_nums):
             continue
         # non-python or created/deleted/renamed file
         any_effect = True
+        TOUCH["uncon"] = True
         ot, at_import = mp.open_tests(old or new)
         cand |= ot
         if at_import:
@@ -444,9 +474,11 @@ def precise_func_tests(mp, path, tree, s, e, removed, inserts):
                 if b is not None:
                     spans.add((b[0], b[1]))
     if whole or not spans:
+        TOUCH["spans"].append((path, s, e))
         return mp.span_tests(path, s, e)
     res = set()
     for st, en in spans:
+        TOUCH["spans"].append((path, st, en))
         res |= mp.span_tests(path, st, en)
     return res
 
@@ -592,8 +624,11 @@ def fork_pytest(root, args, envupd):
 
 
 def prepare_run(cid, changes, nums, tests_by_num):
+    changes, cases = changes if isinstance(changes, tuple) else (changes, {})
     root = TMP / f"ov_{cid}"
     build_overlay(root, changes)
+    cases_file = TMP / f"cases_{cid}.json"
+    cases_file.write_text(json.dumps(cases))
     ids = sorted(tests_by_num[n]["id"] for n in nums)
     res_file = TMP / f"res_{cid}.json"
     args_file = TMP / f"args_{cid}.txt"
@@ -601,14 +636,14 @@ def prepare_run(cid, changes, nums, tests_by_num):
     to_file = TMP / f"to_{cid}.json"
     to_file.write_text(json.dumps({tests_by_num[n]["id"]: max(10.0, 8 * tests_by_num[n]["seconds"]) for n in nums}))
     envupd = dict(PYTHONDONTWRITEBYTECODE="1", SKIP_INTEGRATION="0", BR_RES=str(res_file),
-                  BR_WANTED=str(args_file), BR_TIMEOUTS=str(to_file), HOME=str(TMP),
+                  BR_WANTED=str(args_file), BR_TIMEOUTS=str(to_file), HOME=str(TMP), BR_CASES=str(cases_file),
                   PYTHONPATH=f"{root}:{APP}")
     test_files = sorted({tests_by_num[n]["file"] for n in nums})
     test_files = [f for f in test_files if (root / f).exists()]
     args = ["-q", "-p", "no:cacheprovider", "-p", "runner_plugin", "--rootdir", str(root), "-o", "addopts=",
             "--no-header", "-rN", "--tb=no", "--assert=plain", "-W", "ignore"] + test_files
     budget = max(30.0, sum(tests_by_num[n]["seconds"] for n in nums) * 8 + 30)
-    return root, args, envupd, budget, res_file, [args_file, to_file, res_file]
+    return root, args, envupd, budget, res_file, [args_file, to_file, res_file, cases_file]
 
 
 def collect_run(cid, root, res_file, cleanup):
@@ -627,6 +662,7 @@ def collect_run(cid, root, res_file, cleanup):
 
 
 def run_tests(cid, changes, nums, tests_by_num):
+    changes = changes[0] if isinstance(changes, tuple) else changes
     root = TMP / f"ov_{cid}"
     build_overlay(root, changes)
     ids = sorted(tests_by_num[n]["id"] for n in nums)
@@ -684,7 +720,7 @@ def is_blind(t):
 CPU_K = float(os.environ.get("BR_K", "0.07"))  # profile CPU (map) -> scorer CPU seconds
 
 
-def choose_blind(allc, tests_by_num, mp):
+def choose_blind(allc, tests_by_num, mp, frac=None):
     """Per test class: include unverified when that is cheaper than running it."""
     if not mp.cpu:
         return {n for n in allc if is_blind(tests_by_num[n])}
@@ -695,7 +731,8 @@ def choose_blind(allc, tests_by_num, mp):
     blind = set()
     for g, ns in groups.items():
         all_blind = sum(tests_by_num[n]["seconds"] for n in ns)
-        per = {n: (tests_by_num[n]["seconds"], CPU_K * mp.cpu.get(n, 1.0)) for n in ns}
+        frac = frac or {}
+        per = {n: (tests_by_num[n]["seconds"], CPU_K * mp.cpu.get(n, 1.0) * frac.get(n, 1.0)) for n in ns}
         mixed = CPU_K * mp.setup.get(g, 0.0) + sum(min(a, b) for a, b in per.values())
         if all_blind <= mixed:
             blind |= ns
@@ -758,8 +795,8 @@ def main():
             answers[cid] = []
             log(cid, "no effect" if not effect else "no candidates")
             continue
-        jobs.append((cid, changes, cand))
-    est = sum(sum(tests_by_num[n]["seconds"] for n in c) for _, _, c in jobs)
+        jobs.append((cid, changes, cand, dict(spans=list(TOUCH["spans"]), uncon=TOUCH["uncon"])))
+    est = sum(sum(tests_by_num[n]["seconds"] for n in c) for _, _, c, _ in jobs)
     log(f"{len(jobs)} commits to run, est {est:.1f}s of tests")
 
     def interpret(cid, allc, blind, cand, r):
@@ -784,8 +821,18 @@ def main():
 
     jobs.sort(key=lambda j: -sum(tests_by_num[n]["seconds"] for n in j[2]))
     queue = []
-    for cid, changes, allc in jobs:
-        blind = choose_blind(allc, tests_by_num, mp)
+    for cid, changes, allc, touch in jobs:
+        cases = {}
+        frac = {}
+        if not touch["uncon"]:
+            for n in allc:
+                al = mp.allowed_cases(n, touch["spans"])
+                if al is not None:
+                    info = mp.cases[n]
+                    cases[tests_by_num[n]["id"]] = {info["kind"]: sorted(al)}
+                    frac[n] = max(0.03, len(al) / max(1, info["n"]))
+        changes = (changes, cases)
+        blind = choose_blind(allc, tests_by_num, mp, frac)
         cand = allc - blind
         if not cand:
             answers[cid] = sorted(blind)
@@ -846,11 +893,33 @@ def main():
         cid = p.stem
         nums = answers.get(cid, sorted(all_nums))
         print(json.dumps({"commit": cid, "workers": split(nums, tests_by_num)}), flush=True)
+        PRINTED.add(cid)
     import resource
     a = resource.getrusage(resource.RUSAGE_SELF)
     b = resource.getrusage(resource.RUSAGE_CHILDREN)
     log(f"done in {time.time() - START:.1f}s cpu self {a.ru_utime + a.ru_stime:.1f}s children {b.ru_utime + b.ru_stime:.1f}s")
 
 
+PRINTED = set()
+
+
+def safe_main():
+    try:
+        main()
+    except BaseException as e:  # noqa: BLE001 - never leave a commit unanswered
+        import traceback
+        traceback.print_exc()
+        log("selector crashed, answering remaining commits with every test", repr(e))
+        try:
+            tests = json.loads((DATA / "tests.json").read_text())["tests"]
+            tb = {t["number"]: t for t in tests}
+            for p in sorted((DATA / "commits").glob("*.patch")):
+                if p.stem not in PRINTED:
+                    print(json.dumps({"commit": p.stem, "workers": split(sorted(tb), tb)}), flush=True)
+                    PRINTED.add(p.stem)
+        except BaseException:  # noqa: BLE001
+            traceback.print_exc()
+
+
 if __name__ == "__main__":
-    main()
+    safe_main()
