@@ -9,11 +9,13 @@ For each patch:
 """
 
 import ast
+import copy
 import gzip
 import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -26,7 +28,8 @@ APP = Path(__file__).resolve().parent
 MAP = APP / "map.json.gz"
 TMP = Path(os.environ.get("BR_TMP", "/tmp"))
 PARALLEL = int(os.environ.get("BR_PAR", "2"))
-DEADLINE = float(os.environ.get("BR_DEADLINE", "150"))  # seconds of wall time we allow ourselves
+DEADLINE = float(os.environ.get("BR_DEADLINE", "145"))  # seconds of wall time to stop launching new runs
+HARD_DEADLINE = float(os.environ.get("BR_HARD_DEADLINE", str(DEADLINE + 15)))  # kill in-flight children & flush
 START = time.time()
 
 
@@ -237,6 +240,7 @@ class Map:
         ids = m["tests"]
         num = {t["id"]: t["number"] for t in tests}
         self.conv = [num.get(t) for t in ids]  # map idx -> /data number
+        self.num_to_idx = {num: i for i, num in enumerate(self.conv) if num is not None}
         self.files = {f: {int(k): v for k, v in d.items()} for f, d in m["files"].items()}
         self.import_lines = {f: set(v) for f, v in m["import_lines"].items()}
         self.opens = m["opens"]
@@ -255,18 +259,23 @@ class Map:
 
     def allowed_cases(self, n, spans):
         info = self.cases.get(n)
-        if info is None:
+        mi = self.num_to_idx.get(n)
+        if info is None or mi is None:
             return None
         acc = set()
         for path, st, en in spans:
-            fl = info["files"].get(path)
-            if not fl:
-                continue
+            fl_full = self.files.get(path)
+            fl_case = info["files"].get(path)
             for ln in range(st, en + 1):
-                sid_ = fl.get(str(ln))
-                if sid_ is not None:
-                    acc |= self.csets[sid_]
-        return acc
+                fsid = fl_full.get(ln) if fl_full else None
+                covered = fsid is not None and mi in self.sets[fsid]
+                csid = fl_case.get(str(ln)) if fl_case else None
+                if covered and csid is None:
+                    # Touched line ran outside recorded fixture cases (e.g. setUp/setUpClass/inline)
+                    return None
+                if csid is not None:
+                    acc |= self.csets[csid]
+        return acc if acc else None
 
     def _num(self, idxs):
         return {self.conv[i] for i in idxs if i >= 0 and self.conv[i] is not None}
@@ -344,13 +353,26 @@ def candidates(files, mp, tests, all_nums):
                     cand |= set(all_nums)
                 continue
             if not cu:
+                if _coding_changed(old_text, new_text):
+                    any_effect = True
+                    TOUCH["uncon"] = True
+                    cand |= mp.file_tests(old)
+                    if old.startswith("tests/"):
+                        cand |= tests_in_file(tests, old)
                 continue  # comment/formatting only
             any_effect = True
+            ot, _ = mp.open_tests(old)
+            cand |= ot
             removed, inserts = hunk_lines(f["hunks"])
             old_tree = ast.parse(old_text)
+            new_tree = ast.parse(new_text)
             for kind, q, (s, e) in cu:
                 if kind == "func":
                     cand |= precise_func_tests(mp, old, old_tree, s, e, removed, inserts)
+                elif (lo := lambda_only(old_tree, new_tree, q)) is not None:
+                    for ls, le in lo:
+                        TOUCH["spans"].append((old, ls, le))
+                        cand |= mp.span_tests(old, ls, le)
                 elif kind == "cls":
                     TOUCH["uncon"] = True
                     cand |= mp.span_tests(old, s, e)
@@ -494,6 +516,76 @@ def dir_tests(mp, tests, path):
     return res
 
 
+CODING_RE = re.compile(r"^[ \t\f]*#.*?coding[:=][ \t]*([-\w.]+)")
+
+
+def _coding_changed(old_text, new_text):
+    ol = old_text.splitlines()[:2]
+    nl = new_text.splitlines()[:2]
+    return ol != nl and any(CODING_RE.match(line) for line in ol + nl)
+
+
+def _find_unit_body(tree, cls_q):
+    if not cls_q:
+        return tree.body
+    body = tree.body
+    for part in cls_q.split("."):
+        found = None
+        for st in body:
+            if isinstance(st, ast.ClassDef) and st.name == part:
+                found = st.body
+                break
+        if found is None:
+            return None
+        body = found
+    return body
+
+
+def _strip_lambda_bodies(stmts):
+    def mask(node):
+        if isinstance(node, ast.Lambda):
+            lams.append((node.lineno, node.end_lineno, _dump(node.body)))
+            return ast.Lambda(args=node.args, body=ast.Constant(value=None))
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            return node
+        for field, val in ast.iter_fields(node):
+            if isinstance(val, ast.AST):
+                setattr(node, field, mask(val))
+            elif isinstance(val, list):
+                setattr(node, field, [mask(x) if isinstance(x, ast.AST) else x for x in val])
+        return node
+
+    lams = []
+    out = []
+    for st in stmts:
+        if isinstance(st, FUNC):
+            out.append("def:" + st.name + ":" + "".join(_dump(d) for d in st.decorator_list))
+        elif isinstance(st, ast.ClassDef):
+            out.append("class:" + st.name)
+        else:
+            st2 = copy.deepcopy(st)
+            mask(st2)
+            out.append(_dump(st2))
+    return "\n".join(out), lams
+
+
+def lambda_only(old_tree, new_tree, q):
+    """If the only AST difference in unit `q` is inside lambda bodies, return those lambdas' old spans."""
+    if not q.endswith("<own>"):
+        return None
+    cls_q = q[:-len(".<own>")] if q.endswith(".<own>") else ""
+    ob = _find_unit_body(old_tree, cls_q)
+    nb = _find_unit_body(new_tree, cls_q)
+    if ob is None or nb is None:
+        return None
+    od, ol = _strip_lambda_bodies(ob)
+    nd, nl = _strip_lambda_bodies(nb)
+    if od != nd or len(ol) != len(nl) or not ol:
+        return None
+    spans = {(s, e) for (s, e, obody), (_, _, nbody) in zip(ol, nl) if obody != nbody}
+    return spans or None
+
+
 def class_users(mp, path, q, old_text):
     """Tests that use a class: cover any line of it (methods/lambdas), or of same-named subclasses in the file."""
     cls_q = q.rsplit(".", 1)[0]
@@ -521,11 +613,12 @@ def class_users(mp, path, q, old_text):
     mod = path[:-3].replace("/", ".")
     if mod.endswith(".__init__"):
         mod = mod[: -len(".__init__")]
-    res |= mp.class_tests(mod + ":" + cls_q)
-    # if the class has no executed lines at all (pure data class), fall back to the whole file
+    users = mp.class_tests(mod + ":" + cls_q)
+    res |= users
+    # if the class has no executed lines and no recorded users (pure data class), use the whole file
     fl = mp.files.get(path, {})
     has = any(target.lineno <= ln <= target.end_lineno for ln in fl)
-    if not has:
+    if not has and not users:
         res |= mp.file_tests(path)
     return res
 
@@ -607,9 +700,12 @@ def warm_imports():
 
 def fork_pytest(root, args, envupd):
     """Fork a child that runs pytest in the overlay. Returns pid."""
+    sys.stdout.flush()
+    sys.stderr.flush()
     pid = os.fork()
     if pid == 0:
         try:
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
             fd = os.open(os.devnull, os.O_RDWR)
             os.dup2(fd, 1)
             os.dup2(fd, 2)
@@ -741,8 +837,8 @@ def choose_blind(allc, tests_by_num, mp, frac=None):
     return blind
 
 
-GATE = float(os.environ.get("BR_GATE", "2.0"))  # scorer CPU seconds above which a test is gated
-RUN_BASE = 0.3  # scorer CPU seconds of one pytest run
+GATE = float(os.environ.get("BR_GATE", "10.0"))  # scorer CPU seconds above which a test is gated
+RUN_BASE = float(os.environ.get("BR_BASE", "1.0"))  # scorer CPU seconds of one pytest run
 
 
 def out_cost(nums, tests_by_num):
@@ -803,6 +899,7 @@ def split(nums, tests_by_num):
 # --------------------------------------------------------------------------- main
 
 def main():
+    ANSWERS.clear()
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     tests_by_num = {t["number"]: t for t in tests}
     by_id = {t["id"]: t["number"] for t in tests}
@@ -810,7 +907,13 @@ def main():
     mp = Map(MAP, tests)
     patches = sorted((DATA / "commits").glob("*.patch"))
     jobs = []
-    answers = {}
+
+    def emit(cid, nums):
+        ANSWERS[cid] = nums
+        if cid not in PRINTED:
+            print(json.dumps({"commit": cid, "workers": split(nums, tests_by_num)}), flush=True)
+            PRINTED.add(cid)
+
     for p in patches:
         cid = p.stem
         try:
@@ -829,10 +932,10 @@ def main():
             cand, effect, why = candidates(files, mp, tests, all_nums)
         except Exception as e:
             log(cid, "analysis failed", repr(e))
-            answers[cid] = sorted(all_nums)  # unknown: run everything (unverified)
+            emit(cid, sorted(all_nums))  # unknown: run everything (unverified)
             continue
         if not effect or not cand:
-            answers[cid] = []
+            emit(cid, [])
             log(cid, "no effect" if not effect else "no candidates")
             continue
         jobs.append((cid, changes, cand, dict(spans=list(TOUCH["spans"]), uncon=TOUCH["uncon"])))
@@ -872,26 +975,34 @@ def main():
                 al = mp.allowed_cases(n, touch["spans"])
                 if al is not None:
                     info = mp.cases[n]
-                    cases[tests_by_num[n]["id"]] = {info["kind"]: sorted(al)}
-                    frac[n] = max(0.03, len(al) / max(1, info["n"]))
+                    if len(al) < info["n"]:
+                        cases[tests_by_num[n]["id"]] = {info["kind"]: sorted(al)}
+                        frac[n] = max(0.03, len(al) / max(1, info["n"]))
         changes = (changes, cases)
         gated, blind, cand = plan(allc, tests_by_num, mp, frac)
         if not cand:
-            answers[cid] = sorted(blind | gated)
+            emit(cid, sorted(blind | gated))
             log(cid, "blind", len(blind), "gated", len(gated))
         else:
             queue.append((cid, changes, allc, blind, cand, gated))
 
     use_fork = os.environ.get("BR_FORK", "1") == "1" and hasattr(os, "fork")
     if use_fork:
+        import resource
+        _r0 = resource.getrusage(resource.RUSAGE_SELF)
         warm_imports()
+        _r1 = resource.getrusage(resource.RUSAGE_SELF)
+        log(f"warm cpu {_r1.ru_utime + _r1.ru_stime - _r0.ru_utime - _r0.ru_stime:.2f} plan cpu {_r0.ru_utime + _r0.ru_stime:.2f}")
         running = {}  # pid -> (job, started, budget, root, res_file, cleanup)
+        killed = set()
         while queue or running:
             while queue and len(running) < PARALLEL:
+                if time.time() - START > HARD_DEADLINE:
+                    break
                 job = queue.pop(0)
                 cid, changes, allc, blind, cand, gated = job
                 if time.time() - START > DEADLINE:
-                    answers[cid] = sorted(allc)
+                    emit(cid, sorted(allc))
                     log(cid, "deadline")
                     continue
                 root, args, envupd, budget, res_file, cleanup = prepare_run(cid, changes, cand, tests_by_num)
@@ -899,12 +1010,19 @@ def main():
                 running[pid] = (job, time.time(), budget, root, res_file, cleanup)
             if not running:
                 break
-            pid, status = os.waitpid(-1, os.WNOHANG)
+            pid, status, ru = os.wait4(-1, os.WNOHANG)
             if pid == 0:
                 now = time.time()
+                hard_hit = now - START > HARD_DEADLINE
+                if hard_hit:
+                    while queue:
+                        j = queue.pop(0)
+                        emit(j[0], sorted(j[2]))
+                        log(j[0], "hard-deadline")
                 for rp, (job, started, budget, *_rest) in list(running.items()):
-                    if now - started > budget:
-                        log(job[0], "killing after", round(now - started, 1))
+                    if rp not in killed and (hard_hit or now - started > budget):
+                        log(job[0], "hard-deadline killing" if hard_hit else "killing after", round(now - started, 1))
+                        killed.add(rp)
                         try:
                             os.kill(rp, 9)
                         except OSError:
@@ -913,11 +1031,13 @@ def main():
                 continue
             if pid not in running:
                 continue
+            killed.discard(pid)
             job, started, budget, root, res_file, cleanup = running.pop(pid)
             cid, changes, allc, blind, cand, gated = job
             r = collect_run(cid, root, res_file, cleanup)
-            answers[cid], why = interpret(cid, allc, blind, cand, r, gated)
-            log(cid, why, "->", len(answers[cid]), f"failing ({time.time() - started:.1f}s)")
+            res, why = interpret(cid, allc, blind, cand, r, gated)
+            emit(cid, res)
+            log(cid, why, "->", len(res), f"failing ({time.time() - started:.1f}s cpu {ru.ru_utime + ru.ru_stime:.2f})")
     else:
         def work(job):
             cid, changes, allc, blind, cand, gated = job
@@ -929,13 +1049,10 @@ def main():
 
         with ThreadPoolExecutor(PARALLEL) as ex:
             for cid, res, why in ex.map(work, queue):
-                answers[cid] = res
+                emit(cid, res)
                 log(cid, why, "->", len(res), "failing")
     for p in patches:
-        cid = p.stem
-        nums = answers.get(cid, sorted(all_nums))
-        print(json.dumps({"commit": cid, "workers": split(nums, tests_by_num)}), flush=True)
-        PRINTED.add(cid)
+        emit(p.stem, ANSWERS.get(p.stem, sorted(all_nums)))
     import resource
     a = resource.getrusage(resource.RUSAGE_SELF)
     b = resource.getrusage(resource.RUSAGE_CHILDREN)
@@ -943,22 +1060,31 @@ def main():
 
 
 PRINTED = set()
+ANSWERS = {}
+
+
+def _on_sigterm(signum, frame):
+    raise SystemExit(0)
 
 
 def safe_main():
+    signal.signal(signal.SIGTERM, _on_sigterm)
     try:
         main()
     except BaseException as e:  # noqa: BLE001 - never leave a commit unanswered
         import traceback
-        traceback.print_exc()
-        log("selector crashed, answering remaining commits with every test", repr(e))
+        if not isinstance(e, SystemExit):
+            traceback.print_exc()
+        log("selector exiting/crashed, answering remaining commits", repr(e))
         try:
             tests = json.loads((DATA / "tests.json").read_text())["tests"]
             tb = {t["number"]: t for t in tests}
             for p in sorted((DATA / "commits").glob("*.patch")):
                 if p.stem not in PRINTED:
-                    print(json.dumps({"commit": p.stem, "workers": split(sorted(tb), tb)}), flush=True)
+                    nums = ANSWERS.get(p.stem, sorted(tb))
+                    print(json.dumps({"commit": p.stem, "workers": split(nums, tb)}), flush=True)
                     PRINTED.add(p.stem)
+            sys.stdout.flush()
         except BaseException:  # noqa: BLE001
             traceback.print_exc()
 
