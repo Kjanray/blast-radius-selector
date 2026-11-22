@@ -717,7 +717,7 @@ def is_blind(t):
     return s >= 1.0
 
 
-CPU_K = float(os.environ.get("BR_K", "0.07"))  # profile CPU (map) -> scorer CPU seconds
+CPU_K = float(os.environ.get("BR_K", "0.12"))  # profile CPU (map) -> scorer CPU seconds
 
 
 def choose_blind(allc, tests_by_num, mp, frac=None):
@@ -739,6 +739,46 @@ def choose_blind(allc, tests_by_num, mp, frac=None):
         else:
             blind |= {n for n, (a, b) in per.items() if a < b}
     return blind
+
+
+GATE = float(os.environ.get("BR_GATE", "2.0"))  # scorer CPU seconds above which a test is gated
+RUN_BASE = 0.3  # scorer CPU seconds of one pytest run
+
+
+def out_cost(nums, tests_by_num):
+    ws = split(sorted(nums), tests_by_num)
+    if not ws:
+        return 0.0
+    return max(sum(tests_by_num[n]["seconds"] for n in w) for w in ws) + 2.0 * len(ws)
+
+
+def verify_cost(nums, tests_by_num, mp, frac):
+    if not nums:
+        return 0.0
+    groups = {"::".join(tests_by_num[n]["id"].split("::")[:-1]) for n in nums}
+    return RUN_BASE + CPU_K * (sum(mp.cpu.get(n, 1.0) * frac.get(n, 1.0) for n in nums)
+                               + sum(mp.setup.get(g, 0.0) for g in groups))
+
+
+def plan(allc, tests_by_num, mp, frac=None):
+    """Return (gated, blind, verify).
+
+    gated: very expensive tests left out unless some verified test fails.
+    blind: included without running.  verify: run, keep the failures.
+    """
+    frac = frac or {}
+    heavy = {n for n in allc if CPU_K * mp.cpu.get(n, 1.0) * frac.get(n, 1.0) >= GATE} if mp.cpu else set()
+    rest = allc - heavy
+    gated = heavy if heavy and len(rest) >= 5 else set()
+    pool = allc - gated
+    blind = choose_blind(pool, tests_by_num, mp, frac)
+    # if nothing turns out to fail, is verifying everything cheaper than paying for the blind workers?
+    if blind:
+        with_blind = out_cost(blind, tests_by_num) + verify_cost(pool - blind, tests_by_num, mp, frac)
+        all_verify = verify_cost(pool, tests_by_num, mp, frac)
+        if all_verify < with_blind:
+            blind = set()
+    return gated, blind, pool - blind
 
 
 # --------------------------------------------------------------------------- split
@@ -799,7 +839,7 @@ def main():
     est = sum(sum(tests_by_num[n]["seconds"] for n in c) for _, _, c, _ in jobs)
     log(f"{len(jobs)} commits to run, est {est:.1f}s of tests")
 
-    def interpret(cid, allc, blind, cand, r):
+    def interpret(cid, allc, blind, cand, r, gated=frozenset()):
         if r is None:
             return sorted(allc), "runner-failed"
         failed = set()
@@ -817,7 +857,10 @@ def main():
         for n in cand:
             if tests_by_num[n]["id"] not in seen:
                 failed.add(n)
-        return sorted((failed & cand) | blind), f"ran {len(cand)} blind {len(blind)}"
+        res = (failed & cand) | blind
+        if gated and (failed & cand):
+            res |= gated
+        return sorted(res), f"ran {len(cand)} blind {len(blind)} gated {len(gated)}{' +' if gated and (failed & cand) else ''}"
 
     jobs.sort(key=lambda j: -sum(tests_by_num[n]["seconds"] for n in j[2]))
     queue = []
@@ -832,13 +875,12 @@ def main():
                     cases[tests_by_num[n]["id"]] = {info["kind"]: sorted(al)}
                     frac[n] = max(0.03, len(al) / max(1, info["n"]))
         changes = (changes, cases)
-        blind = choose_blind(allc, tests_by_num, mp, frac)
-        cand = allc - blind
+        gated, blind, cand = plan(allc, tests_by_num, mp, frac)
         if not cand:
-            answers[cid] = sorted(blind)
-            log(cid, "blind", len(blind))
+            answers[cid] = sorted(blind | gated)
+            log(cid, "blind", len(blind), "gated", len(gated))
         else:
-            queue.append((cid, changes, allc, blind, cand))
+            queue.append((cid, changes, allc, blind, cand, gated))
 
     use_fork = os.environ.get("BR_FORK", "1") == "1" and hasattr(os, "fork")
     if use_fork:
@@ -847,7 +889,7 @@ def main():
         while queue or running:
             while queue and len(running) < PARALLEL:
                 job = queue.pop(0)
-                cid, changes, allc, blind, cand = job
+                cid, changes, allc, blind, cand, gated = job
                 if time.time() - START > DEADLINE:
                     answers[cid] = sorted(allc)
                     log(cid, "deadline")
@@ -872,17 +914,17 @@ def main():
             if pid not in running:
                 continue
             job, started, budget, root, res_file, cleanup = running.pop(pid)
-            cid, changes, allc, blind, cand = job
+            cid, changes, allc, blind, cand, gated = job
             r = collect_run(cid, root, res_file, cleanup)
-            answers[cid], why = interpret(cid, allc, blind, cand, r)
+            answers[cid], why = interpret(cid, allc, blind, cand, r, gated)
             log(cid, why, "->", len(answers[cid]), f"failing ({time.time() - started:.1f}s)")
     else:
         def work(job):
-            cid, changes, allc, blind, cand = job
+            cid, changes, allc, blind, cand, gated = job
             if time.time() - START > DEADLINE:
                 return cid, sorted(allc), "deadline"
             r = run_tests(cid, changes, cand, tests_by_num)
-            res, why = interpret(cid, allc, blind, cand, r)
+            res, why = interpret(cid, allc, blind, cand, r, gated)
             return cid, res, why
 
         with ThreadPoolExecutor(PARALLEL) as ex:
